@@ -6,7 +6,7 @@ use std::thread;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 #[derive(Debug)]
 struct Machine {
@@ -17,7 +17,8 @@ struct Machine {
     outputs: Sender<i128>,
     base: i128,
     idle: bool,
-    numIdle: Arc<AtomicI8>,
+    num_queued: Arc<AtomicI64>,
+    num_idle: Arc<AtomicI64>,
 }
 
 fn read(m: &Machine, index: i128) -> i128 {
@@ -102,20 +103,19 @@ fn do_input(m: &mut Machine) -> bool {
         Ok(x) => {
             if m.idle {
                 m.idle = false;
-                m.numIdle.fetch_add(-1, Ordering::SeqCst);
+                m.num_idle.fetch_add(-1, Ordering::SeqCst);
             }
+            m.num_queued.fetch_add(-1, Ordering::SeqCst);
             x
         },
         _ => {
             if !m.idle {
                 m.idle = true;
-                m.numIdle.fetch_add(1, Ordering::SeqCst);
+                m.num_idle.fetch_add(1, Ordering::SeqCst);
             }
-            thread::sleep(time::Duration::from_millis(10));
             -1
         }
     };
-    // let value = m.inputs.recv().unwrap();
     // println!("Machine {} read {} from input storing at {}", m.id, value, pos);
     store(m, pos, value);
     if pos != m.ip {
@@ -129,6 +129,7 @@ fn do_output(m: &mut Machine) -> bool {
     let value = get_index(m, 1, m1);
     // println!("Machine {} outputting {}", m.id, value);
     m.outputs.send(value).unwrap();
+    m.num_queued.fetch_add(1, Ordering::SeqCst);
     m.ip += 2;
     true
 }
@@ -214,7 +215,7 @@ fn run_machine(mut m: Machine) -> thread::JoinHandle<Machine> {
     })
 }
 
-fn new_machine(program: HashMap<i128, i128>, counter: Arc<AtomicI8>) -> (Machine, Sender<i128>, Receiver<i128>) {
+fn new_machine(program: HashMap<i128, i128>, counter: Arc<AtomicI64>, idle: Arc<AtomicI64>) -> (Machine, Sender<i128>, Receiver<i128>) {
     let (my_input, input) = mpsc::channel();
     let (output, my_output) = mpsc::channel();
     let mac = Machine {
@@ -225,7 +226,8 @@ fn new_machine(program: HashMap<i128, i128>, counter: Arc<AtomicI8>) -> (Machine
         outputs: output,
         base: 0,
         idle: false,
-        numIdle: counter
+        num_queued: counter,
+        num_idle: idle,
     };
     (mac, my_input, my_output)
 }
@@ -242,11 +244,13 @@ fn main() {
     let mut incoming_channels = HashMap::new();
     let mut outgoing_channels = HashMap::new();
     let mut threads = HashMap::new();
-    let mut counter = Arc::new(AtomicI8::new(0));
+    let mut counter = Arc::new(AtomicI64::new(50));
+    let mut idle_count = Arc::new(AtomicI64::new(0));
     let (nat_sender, nat_receiver) = mpsc::channel();
+    
     for i in 0..50 {
         let (mac, my_input, my_output) = new_machine(
-            arr.clone(), Arc::clone(&counter));
+            arr.clone(), Arc::clone(&counter), Arc::clone(&idle_count));
         let m = run_machine(mac);
         threads.insert(i, m);
         my_input.send(i).unwrap();
@@ -257,6 +261,7 @@ fn main() {
         let incoming: Receiver<i128> = incoming_channels.remove(&i).unwrap();
         let channels = outgoing_channels.clone();
         let nat = nat_sender.clone();
+        let counter_i = Arc::clone(&counter);
         thread::spawn(move || {
             loop {
                 match incoming.recv() {
@@ -266,11 +271,13 @@ fn main() {
                         if dest == 255 {
                             // println!("{} {}", x, y);
                             nat.send((x, y)).unwrap();
-                            continue;
+                            counter_i.fetch_add(-2, Ordering::SeqCst);
+                        } else {
+                            let dest_channel = channels.get(&dest).unwrap();
+                            dest_channel.send(x).unwrap();
+                            dest_channel.send(y).unwrap();
+                            counter_i.fetch_add(-1, Ordering::SeqCst);
                         }
-                        let dest_channel = channels.get(&dest).unwrap();
-                        dest_channel.send(x).unwrap();
-                        dest_channel.send(y).unwrap();
                     }
                     _ => {
                         break;
@@ -282,12 +289,15 @@ fn main() {
     let channels = outgoing_channels.clone();
     thread::spawn(move || {
         let send_to = channels.get(&0).unwrap();
-        let mut seen_y = HashSet::new();
+        let mut llast_y = -2;
         let mut last_x = -1;
         let mut last_y = -1;
+        thread::sleep(time::Duration::from_millis(100));
         loop {
             match nat_receiver.try_recv() {
                 Ok((x, y)) => {
+                    counter.fetch_add(-1, Ordering::SeqCst);
+                    println!("{} {}", x, y);
                     last_x = x;
                     last_y = y;
                 }
@@ -296,19 +306,20 @@ fn main() {
                 }
             }
             let counter_now = counter.load(Ordering::SeqCst);
+            let idle_now = idle_count.load(Ordering::SeqCst);
             // println!("{}", counter_now);
-            if counter_now == 50 {
+            if counter_now == 0 && idle_now == 50 {
                 println!("IDLE! Sent {} {}", last_x, last_y);
-                if seen_y.contains(&last_y) {
+                send_to.send(last_x).unwrap();
+                send_to.send(last_y).unwrap();
+                counter.fetch_add(2, Ordering::SeqCst);
+                if last_y == llast_y {
                     println!("ANS {}", last_y);
                     break;
                 }
-                send_to.send(last_x).unwrap();
-                send_to.send(last_y).unwrap();
-                seen_y.insert(last_y);
-                thread::sleep(time::Duration::from_millis(100));
+                llast_y = last_y;
             } else {
-                thread::sleep(time::Duration::from_millis(100));
+                thread::sleep(time::Duration::from_millis(10));
             }
         }
     });
